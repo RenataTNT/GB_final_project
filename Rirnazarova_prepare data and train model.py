@@ -1,12 +1,9 @@
 #export SPARK_KAFKA_VERSION=0.10
 #/spark2.4/bin/pyspark --packages org.apache.spark:spark-sql-kafka-0-10_2.11:2.4.5,com.datastax.spark:spark-cassandra-connector_2.11:2.4.2 --driver-memory 512m --driver-cores 1 --master local[1]
-from pyspark.ml import Pipeline, PipelineModel
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.types import StructType, StringType, IntegerType, TimestampType, FloatType, DoubleType, DateType
+from pyspark.sql.types import StructType, StringType, IntegerType, TimestampType, FloatType, DoubleType, DateType, ArrayType
 from pyspark.sql import functions as F
-from pyspark.sql.functions import col
-from pyspark.ml.classification import LogisticRegression
-from pyspark.ml.feature import OneHotEncoderEstimator, VectorAssembler, CountVectorizer, StringIndexer, IndexToString
+from pyspark.sql.functions import col, isnan, udf
 from pyspark.sql.functions import to_date, month, year, date_add
 
 
@@ -17,13 +14,13 @@ spark = SparkSession.builder.appName("rirnazarova_spark").getOrCreate()
 CRM_df=spark.read.csv("RI_finalProject/pipeline_CRM.csv", sep=';', header=True) \
     .withColumn('Customer ID', col('Customer ID').cast(StringType())) \
     .withColumn('Customer Type', col('Customer Type').cast(StringType())) \
-    .withColumn('Opportunity ID', col('Opportunity ID').cast(StringType())) \
+    .withColumn('Opportunity ID', col('Opportunity ID').cast(IntegerType())) \
     .withColumn('Opportunity Creation Date', to_date(col('Opportunity Creation Date'), "dd.MM.yyyy")) \
     .withColumn('Opportunity Customer Decision Date', to_date(col('Opportunity Customer Decision Date'), "dd.MM.yyyy"))\
     .withColumn('Pipeline Group', col('Pipeline Group').cast(StringType())) \
     .withColumn('Item Origin Country', col('Item Origin Country').cast(StringType())) \
     .withColumn('Item Destination Country', col('Item Destination Country').cast(StringType())) \
-    .withColumn('Item Product Group', col('Item Product Group 2').cast(StringType())) \
+    .withColumn('Item Product Group 2', col('Item Product Group 2').cast(StringType())) \
     .withColumn('Active Pipeline Date', col('Active Pipeline Date').cast(StringType())) \
     .withColumn('Customer Address City', col('Customer Address City').cast(StringType())) \
     .withColumn('Customer Address Country', col('Customer Address Country').cast(StringType())) \
@@ -50,7 +47,7 @@ CRM_df=spark.read.csv("RI_finalProject/pipeline_CRM.csv", sep=';', header=True) 
     .withColumn('Opportunity Contract Start Date', col('Opportunity Contract Start Date').cast(StringType())) \
     .withColumn('Opportunity Contract End Date', col('Opportunity Contract End Date').cast(StringType())) \
     .withColumn('Opportunity Sales Stage', col('Opportunity Sales Stage').cast(StringType())) \
-    .withColumn('Item Expected Value EUR', col('Item Expected Value').cast(DoubleType())) \
+    .withColumn('Item Expected Value', col('Item Expected Value').cast(DoubleType())) \
     .withColumn('Item Number of Shipments', col('Item Number of Shipments').cast(IntegerType())) \
     .withColumn('Item Quantity', col('Item Quantity').cast(DoubleType())) \
     .withColumn('Number of Activities', col('Number of Activities').cast(IntegerType())) \
@@ -71,6 +68,7 @@ CRM_df.count()
 #analyze fields
 CRM_df.select('Customer Type').groupBy('Customer Type').count().show()
 CRM_df.select(year('Opportunity Customer Decision Date').alias('Decision year')).groupBy('Decision year').count().show()
+CRM_df.select('Item Origin Country').groupBy('Item Origin Country').count().show()
 
 #target column
 CRM_df.select('Item Status').groupBy('Item Status').count().show()
@@ -78,6 +76,7 @@ CRM_df.select('Item Status').groupBy('Item Status').count().show()
 # clean fields
 
 CRM_data=CRM_df.withColumn('CustomerType', F.when(col('Customer Type')=="#","P").otherwise(col('Customer Type')))
+#CRM_data=CRM_df.withColumn('Origin Country', F.when(col('EmpResp Item Lane Country')=="#","EmpResp Item Lane Country").otherwise(col('EmpResp Item Lane Country')))
 CRM_data=CRM_data.drop('Customer Type')
 CRM_data=CRM_data.drop('Pipeline Group')
 CRM_data = CRM_data.drop('Active Pipeline Date')
@@ -96,17 +95,22 @@ CRM_data = CRM_data.drop('Item Status Modification Date')
 CRM_data=CRM_data.withColumn('Status', F.when((col('Item Status')!="Won") & (col('Item Status')!="In Progress"),"Lost").otherwise(col('Item Status')))
 CRM_data = CRM_data.drop('Item Status')
 
+CRM_data = CRM_data.drop('Item Status Reason')
+CRM_data = CRM_data.drop('Opportunity Sales Stage')
+CRM_data = CRM_data.drop('Duration Days  Customer Order Received')
+
+CRM_data=CRM_data.na.fill(0,subset=["Duration Days  Preselling", "Duration Days  Qualified", "Duration Days  Selling", "Duration Days  Quote", "Duration Days  Contract"])
 
 #new features
 
-HitRatePivot=CRM_data.groupBy('EmpResp Customer Sales Org','Item Product','EmpResp Item Lane Position Descr','Customer Local Industry','Opportunity Sales Stage' )\
-    .pivot("Status").sum('Item Expected Value EUR')
+HitRatePivot=CRM_data.groupBy('EmpResp Customer Sales Org','Item Product','EmpResp Item Lane Position Descr','Customer Local Industry' )\
+    .pivot("Status").sum('Item Expected Value')
 HitRatePivot.show()
 HitRatePivot=HitRatePivot.na.fill(1,['In Progress','Lost','Won'])
 
 HitRatePivot=HitRatePivot.withColumn('HitRate', F.round(col('Won')/(col("Won")+col('Lost')),2))
 
-CRM_data_final=CRM_data.join(HitRatePivot,on=['EmpResp Customer Sales Org','Item Product','EmpResp Item Lane Position Descr','Customer Local Industry','Opportunity Sales Stage'],how='left')
+CRM_data_final=CRM_data.join(HitRatePivot,on=['EmpResp Customer Sales Org','Item Product','EmpResp Item Lane Position Descr','Customer Local Industry'],how='left')
 
 CRM_data_final.printSchema()
 
@@ -122,11 +126,15 @@ data=data.withColumn("chance", F.when(col("Status")=="Won",1).otherwise(0))
 data=data.drop("Status")
 data.select('chance').groupBy('chance').count().show()
 
+data.printSchema()
+
+
+# for c in data.columns:
+#     data.select(c).where(col(c).isNull() | isnan(c) ).show()
 
 from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.classification import GBTClassifier
 from pyspark.ml.feature import OneHotEncoder, StringIndexer, VectorAssembler
-from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 
 stages = []
 
@@ -137,18 +145,20 @@ stages += [label_stringIdx]
 
 # stringIndexer
 categoricalColumns = ['EmpResp Customer Sales Org', 'Item Product', 'EmpResp Item Lane Position Descr', 'Customer Local Industry', \
-                      'Opportunity Sales Stage', 'Customer ID', 'Opportunity ID', 'Item Origin Country', 'Item Destination Country', \
+                      'Customer ID', 'Item Origin Country', 'Item Destination Country', \
                       'Item Product Group 2', 'Customer Address City', 'Customer Address Country', 'Customer Global Industry', 'Customer Hierarchy Top Node', \
                       'Customer Last Activity End Date', 'Customer Segment', 'EmpResp Item Lane Country', 'EmpResp Item Lane Position Code', \
                       'Expected First Shipment Date', 'Is Customer', 'Is Prospect', 'Item Competitor', 'Item Last Modification Date', \
-                      'Item Status Reason', 'Item Tradelane', 'Item Type', 'Opportunity Contract Start Date', 'Opportunity Contract End Date', 'Item Product Group',  \
+                       'Item Tradelane', 'Item Type', 'Opportunity Contract Start Date', 'Opportunity Contract End Date',   \
                       'CustomerType', 'Customer Decision M_Y', 'Customer Creation M_Y', 'Item Status Modification Date M_Y']
 
 
 
 
-num_columns=['Item Number of Shipments', 'Item Quantity', 'Number of Activities', 'Duration Days  Preselling', 'Duration Days  Qualified', 'Duration Days  Selling', \
-                      'Duration Days  Quote', 'Duration Days  Contract', 'Duration Days  Customer Order Received', 'Item Expected Value EUR','In Progress', 'Lost', 'Won', 'HitRate']
+num_columns=['Opportunity ID','Item Number of Shipments', 'Item Quantity', 'Number of Activities', 'Duration Days  Preselling', 'Duration Days  Qualified', 'Duration Days  Selling', \
+                      'Duration Days  Quote', 'Duration Days  Contract', 'Item Expected Value','In Progress', 'Lost', 'Won', 'HitRate']
+
+
 
 for categoricalCol in categoricalColumns:
     stringIndexer = StringIndexer(inputCol = categoricalCol,
@@ -157,7 +167,6 @@ for categoricalCol in categoricalColumns:
     encoder = OneHotEncoder(inputCol=stringIndexer.getOutputCol(),
                             outputCol=categoricalCol + "classVec")
     stages += [stringIndexer, encoder]
-
 
 #assembler features
 
@@ -183,36 +192,116 @@ pipeline = Pipeline(stages=stages)
 model = pipeline.fit(trainingData)
 
 
+#сохраняем модель на HDFS
+model.write().overwrite().save("rirnazarova_gbt_crm3")
 
 
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
 
-evaluator = BinaryClassificationEvaluator()
+
+crm_model = PipelineModel.load("rirnazarova_gbt_crm3")
 
 # делаем предсказания на тренировочной выборке
-predictions_train = model.transform(trainingData)
+predictions_train = crm_model.transform(trainingData)
 print('Test Area Under ROC for Train data', evaluator.evaluate(predictions_train))
 
 # делаем предсказания на тестовой выборке
-predictions = model.transform(testData)
+predictions = crm_model.transform(testData)
 print('Test Area Under ROC for Test data', evaluator.evaluate(predictions))
 
-predictions.select('prediction').groupBy('prediction').count().show()
-predictions.select('label').groupBy('label').count().show()
 
-predictions.select('Customer ID').where((F.col('prediction')==1) & (F.col('label')==1)).count()
-#сохраняем модель на HDFS
-model.write().overwrite().save("rirnazarova_gbt_crm2")
-predictions.printSchema()
-predictions.select('probability').show()
+#оценка качества модели
+f1=MulticlassClassificationEvaluator(predictionCol='prediction', labelCol='label', metricName='f1')
+accuracy=MulticlassClassificationEvaluator(predictionCol='prediction', labelCol='label', metricName='accuracy')
+
+#accuracy on train and test
+print('Train accuracy', accuracy.evaluate(predictions_train))
+print('Test accuracy', accuracy.evaluate(predictions))
 
 
-#train test valid
 
-crm_model = PipelineModel.load("rirnazarova_gbt_crm2")
+TP=predictions.select('Customer ID').where((F.col('prediction')==1) & (F.col('label')==1)).count()
+TN=predictions.select('Customer ID').where((F.col('prediction')==0) & (F.col('label')==0)).count()
+
+
+c1=predictions.select('Customer ID').where(F.col('label')==1).count()
+Recall=float(TP)/float(c1)
+Recall
+
+FP=predictions.select('Customer ID').where((F.col('prediction')==1) & (F.col('label')==0)).count()
+Precision=float(TP)/float(TP+FP)
+Precision
+
+f1.evaluate(predictions)
+
+
+#выделение основных признаков, влияющих на предсказание
+
 gb_data=crm_model.stages[-1]
-gb_data.featureImportances
 
-predictions.select('features').show(truncate=False)
+def ExtractFeatureImp(featureImp, dataset, featuresCol):
+    list_extract = []
+    for i in dataset.schema[featuresCol].metadata["ml_attr"]["attrs"]:
+        list_extract = list_extract + dataset.schema[featuresCol].metadata["ml_attr"]["attrs"][i]
+    return(list_extract)
 
-list(zip(assemblerInputs, gb_data.featureImportances))
+pred_df= crm_model.transform(testData)
+
+
+l=[x["name"] for x in sorted(pred_df.schema["features"].metadata["ml_attr"]["attrs"]["binary"] \
+                             +pred_df.schema["features"].metadata["ml_attr"]["attrs"]["numeric"], \
+                             key=lambda x: x["idx"])]
+
+fimp=gb_data.featureImportances
+#print(fimp)
+f2=list(fimp)
+FI_list=dict(zip(l,f2))
+sorter_FI=list(sorted(FI_list.items(), key=lambda kv: kv[1]))
+best_features=sorter_FI[-15:]
+
+BF=[]
+for item in best_features:
+    item=list(item)
+    item[0]=str(item[0])
+    item[1] = str(item[1])
+    BF.append(item)
+
+BFschema = StructType() \
+    .add("feature", StringType()) \
+    .add("importance", StringType())
+
+best_featuresDF=spark.createDataFrame(data=BF, schema=BFschema)
+best_featuresDF.sort('importance',ascending=False).show()
+
+
+
+# Предсказпния на валидационной выборке
+prospect_data=CRM_data_final.where(col("Status") =="In Progress").cache()
+prospect_data.count()
+
+prospect_data=prospect_data.drop("Status")
+predictions_prospect = crm_model.transform(prospect_data)
+
+
+#преобразование вектора с вероятностями в массив
+def to_array(col):
+    def to_array_(v):
+        return v.toArray().tolist()
+    return F.udf(to_array_, ArrayType(DoubleType())).asNondeterministic()(col)
+
+predictions_prospect=predictions_prospect.withColumn('proba', to_array(col('probability')))
+
+#выбираем вероятности для 1-го класса
+predictions_prospect=predictions_prospect.withColumn('Chance', col('proba')[1])
+predictions_prospect.select('prediction','Chance').show()
+
+#финальный датасет
+prospect_data_final=prospect_data.join(predictions_prospect \
+                                       .select('Opportunity ID', 'prediction', 'Chance'),on=['Opportunity ID'],how='left')
+
+#сохраняем на hdfs
+
+prospect_data_final.write.option('mode','overwrite'). \
+    option("header","true").csv('RI_finalProject/prospect_data_final.csv')
+
